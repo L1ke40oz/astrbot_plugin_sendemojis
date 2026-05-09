@@ -89,6 +89,7 @@ class SendEmojisPlugin(Star):
         self.llm_timeout: int = int(cfg.get("llm_timeout", 15) or 15)
 
         self.fallback_random: bool = bool(cfg.get("fallback_random_on_fail", True))
+        self.inject_fake_tool_call: bool = bool(cfg.get("inject_fake_tool_call", False))
 
     # ------------------------------------------------------------ 表情包扫描
 
@@ -336,7 +337,8 @@ class SendEmojisPlugin(Star):
             )
 
             # Fake tool call 注入对话历史，让主 LLM 知道自己发送了表情包
-            await self._inject_fake_tool_call(event, emotion_label, emoji_filename)
+            if self.inject_fake_tool_call:
+                await self._inject_fake_tool_call(event, emotion_label, emoji_filename)
 
         except Exception as e:
             logger.error(f"[sendemojis] 发送表情包失败: {e}", exc_info=True)

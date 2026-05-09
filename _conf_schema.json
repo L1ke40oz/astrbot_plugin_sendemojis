@@ -35,5 +35,11 @@
     "type": "bool",
     "hint": "当模型未返回有效情绪或调用失败时，是否从全部表情包中随机选一张发送。关闭则不发。",
     "default": true
+  },
+  "inject_fake_tool_call": {
+    "description": "注入 Fake Tool Call",
+    "type": "bool",
+    "hint": "开启后会将表情包发送行为以伪装工具调用的形式写入对话历史，让主 LLM 知道自己发送了表情包。注意：由于时序竞争，注入不一定每次都成功。",
+    "default": false
   }
 }

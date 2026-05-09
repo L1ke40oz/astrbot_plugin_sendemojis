@@ -2,5 +2,5 @@ name: astrbot_plugin_sendemojis
 display_name: 表情包发送
 desc: 按概率在 AI 回复后发送表情包。支持通过配置的 LLM 判断上下文情绪，从按情绪分类的文件夹中随机挑选图片发送。
 version: v1.0.0
-author: you
-repo: https://github.com/your/astrbot_plugin_sendemojis
+author: L1ke40oz
+repo: https://github.com/L1ke40oz/astrbot_plugin_sendemojis
