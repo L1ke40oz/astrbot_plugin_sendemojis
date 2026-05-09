@@ -1,14 +1,57 @@
-# astrbot-plugin-helloworld
+# astrbot_plugin_sendemojis
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+AstrBot 表情包发送插件 —— 按概率在 AI 回复后自动发送表情包，通过 LLM 判断上下文情绪，从对应情绪文件夹中随机选取图片。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 功能
 
-# Supports
+1. **概率触发**：每次 AI 回复后以可配置概率决定是否发送表情包。
+2. **情绪分类**：命中概率后，将最近对话上下文传给配置的 LLM，由模型从已有情绪文件夹名中选出最匹配的情绪。
+3. **随机选图**：在对应情绪子文件夹中随机挑一张图片发送。
+4. **自动扫描**：插件加载/重载时自动扫描表情包目录。
+5. **手动刷新**：发送 `/reload_emojis` 可手动重新扫描。
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+## 表情包目录结构
+
+```
+emojis/                  ← 主文件夹（可在配置中自定义路径）
+├── happy/               ← 情绪子文件夹
+│   ├── 001.jpg
+│   ├── 002.png
+│   └── ...
+├── sad/
+│   ├── 001.gif
+│   └── ...
+├── angry/
+├── surprised/
+└── neutral/
+```
+
+子文件夹名即为情绪类别名，LLM 会从这些名称中选择。
+
+## 配置项
+
+在 AstrBot 后台插件配置页面可调整：
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `send_probability` | 发送概率 (0.0-1.0) | 0.3 |
+| `emojis_path` | 表情包主文件夹路径（留空用插件目录下 emojis/） | 空 |
+| `llm_provider_id` | 情绪判定 LLM Provider ID（留空用默认） | 空 |
+| `context_rounds` | 传给模型的上下文轮数 | 3 |
+| `llm_timeout` | 模型调用超时（秒） | 15 |
+| `fallback_random_on_fail` | 模型判定失败时是否随机发送 | true |
+
+## 指令
+
+| 指令 | 说明 |
+|------|------|
+| `/reload_emojis` | 重新扫描表情包目录 |
+| `/emojis_status` | 查看当前配置与扫描结果 |
+
+## 安装
+
+将本插件目录放置于 AstrBot 的 `data/plugins/` 下，重启或在后台重载插件即可。
+
+## 依赖
+
+无额外依赖，使用 AstrBot 内置 API。

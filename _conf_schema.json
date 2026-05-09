@@ -1,0 +1,39 @@
+{
+  "send_probability": {
+    "description": "发送概率",
+    "type": "float",
+    "hint": "AI 回复后附带表情包的概率 (0.0 - 1.0)",
+    "default": 0.3
+  },
+  "emojis_path": {
+    "description": "表情包主文件夹路径",
+    "type": "string",
+    "hint": "表情包根目录。支持绝对路径或相对插件目录的相对路径；留空则使用插件目录下的 emojis/。根目录下每个子文件夹代表一种情绪（例如 happy、sad、angry 等），子文件夹内放置对应表情图片。",
+    "default": ""
+  },
+  "llm_provider_id": {
+    "description": "情绪判定模型",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "用于分析上下文情绪的 LLM Provider ID。留空使用 AstrBot 默认 LLM。可在 AstrBot 后台「LLM 配置」中查看已有 Provider ID。",
+    "default": ""
+  },
+  "context_rounds": {
+    "description": "上下文轮数",
+    "type": "int",
+    "hint": "传给模型用于情绪判定的最近对话轮数（一问一答算一轮）。",
+    "default": 3
+  },
+  "llm_timeout": {
+    "description": "模型调用超时 (秒)",
+    "type": "int",
+    "hint": "情绪判定模型调用的超时时间，超时则视为判定失败。",
+    "default": 30
+  },
+  "fallback_random_on_fail": {
+    "description": "判定失败时随机发送",
+    "type": "bool",
+    "hint": "当模型未返回有效情绪或调用失败时，是否从全部表情包中随机选一张发送。关闭则不发。",
+    "default": true
+  }
+}
