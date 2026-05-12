@@ -6,7 +6,9 @@ astrbot_plugin_sendemojis
 2. 重载时自动扫描表情包主目录下的情绪子文件夹；
 3. 命中时将当前上下文交给配置的 LLM，由其判断情绪类别，
    再从对应子文件夹随机挑一张表情图片发送给用户。
-4. 发送后以 fake tool call 形式注入对话历史，让主 LLM 知道自己发送了表情包。
+4. 可选以 fake tool call 形式注入对话历史，让主 LLM 知道自己发送了表情包。
+5. emoji_position 控制表情包位置：before/after/random。
+6. emotion_timing 控制情绪判定时机：parallel（与主LLM并行，最快）/ wait（等主LLM返回后，更准）。
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image
+from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.message.message_event_result import MessageChain
 
@@ -36,32 +38,32 @@ class SendEmojisPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
         self.config: dict[str, Any] = config or {}
-
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # 情绪 -> [图片绝对路径, ...]
         self.emoji_map: dict[str, list[str]] = {}
-        # 所有表情包的扁平列表，用于降级随机
         self.all_emojis: list[str] = []
-        # 实际使用的表情包根目录
         self.emojis_path: str = ""
 
-        # 读取配置
         self._load_runtime_config()
+
+        # parallel 模式：缓存预判结果 {uid: asyncio.Task}
+        self._emotion_tasks: dict[str, asyncio.Task] = {}
 
     # ---------------------------------------------------------------- 生命周期
 
     async def initialize(self) -> None:
-        """插件加载/重载时调用，自动扫描表情包目录。"""
         self._load_runtime_config()
         self._scan_emojis()
         logger.info(
-            f"[sendemojis] 插件已初始化: 概率={self.send_probability}, "
-            f"目录={self.emojis_path}, 情绪数={len(self.emoji_map)}, "
-            f"总图片={len(self.all_emojis)}"
+            f"[sendemojis] 初始化完成: 概率={self.send_probability}, "
+            f"位置={self.emoji_position}, 时机={self.emotion_timing}, "
+            f"情绪数={len(self.emoji_map)}, 总图片={len(self.all_emojis)}"
         )
 
     async def terminate(self) -> None:
+        for task in self._emotion_tasks.values():
+            task.cancel()
+        self._emotion_tasks.clear()
         logger.info("[sendemojis] 插件已停止")
 
     # ------------------------------------------------------------------ 配置
@@ -69,8 +71,7 @@ class SendEmojisPlugin(Star):
     def _load_runtime_config(self) -> None:
         cfg = self.config
 
-        self.send_probability: float = float(cfg.get("send_probability", 0.3) or 0.0)
-        self.send_probability = max(0.0, min(1.0, self.send_probability))
+        self.send_probability: float = max(0.0, min(1.0, float(cfg.get("send_probability", 0.3) or 0.0)))
 
         raw_path = str(cfg.get("emojis_path", "") or "").strip()
         if not raw_path:
@@ -87,26 +88,29 @@ class SendEmojisPlugin(Star):
         self.llm_provider_id: str = str(cfg.get("llm_provider_id", "") or "").strip()
         self.context_rounds: int = int(cfg.get("context_rounds", 3) or 3)
         self.llm_timeout: int = int(cfg.get("llm_timeout", 15) or 15)
-
         self.fallback_random: bool = bool(cfg.get("fallback_random_on_fail", True))
         self.inject_fake_tool_call: bool = bool(cfg.get("inject_fake_tool_call", False))
+
+        pos = str(cfg.get("emoji_position", "after") or "after").strip().lower()
+        self.emoji_position: str = pos if pos in ("before", "after", "random") else "after"
+
+        timing = str(cfg.get("emotion_timing", "parallel") or "parallel").strip().lower()
+        self.emotion_timing: str = timing if timing in ("parallel", "wait") else "parallel"
+
+        self.segment_separator: str = str(cfg.get("segment_separator", "") or "").strip()
 
     # ------------------------------------------------------------ 表情包扫描
 
     def _scan_emojis(self) -> None:
-        """扫描主目录下的情绪子文件夹，加载所有图片路径。"""
         emoji_map: dict[str, list[str]] = {}
         all_emojis: list[str] = []
 
         if not os.path.isdir(self.emojis_path):
             try:
                 os.makedirs(self.emojis_path, exist_ok=True)
-                logger.warning(
-                    f"[sendemojis] 表情包目录不存在，已创建空目录: {self.emojis_path}。"
-                    f"请在其下放置以情绪命名的子文件夹及图片。"
-                )
+                logger.warning(f"[sendemojis] 表情包目录不存在，已创建: {self.emojis_path}")
             except Exception as e:
-                logger.error(f"[sendemojis] 表情包目录无效且无法创建: {self.emojis_path} -> {e}")
+                logger.error(f"[sendemojis] 无法创建表情包目录: {self.emojis_path} -> {e}")
             self.emoji_map = {}
             self.all_emojis = []
             return
@@ -115,13 +119,12 @@ class SendEmojisPlugin(Star):
             sub_dir = os.path.join(self.emojis_path, entry)
             if not os.path.isdir(sub_dir):
                 continue
-            files: list[str] = []
-            for fname in os.listdir(sub_dir):
-                fpath = os.path.join(sub_dir, fname)
-                if not os.path.isfile(fpath):
-                    continue
-                if fname.lower().endswith(self.image_extensions):
-                    files.append(fpath)
+            files = [
+                os.path.join(sub_dir, f)
+                for f in os.listdir(sub_dir)
+                if os.path.isfile(os.path.join(sub_dir, f))
+                and f.lower().endswith(self.image_extensions)
+            ]
             if files:
                 emoji_map[entry] = files
                 all_emojis.extend(files)
@@ -130,23 +133,17 @@ class SendEmojisPlugin(Star):
         self.all_emojis = all_emojis
 
         if not emoji_map:
-            logger.warning(
-                f"[sendemojis] 未在 {self.emojis_path} 下发现任何情绪子文件夹或图片。"
-            )
+            logger.warning(f"[sendemojis] 未在 {self.emojis_path} 下发现表情包。")
 
     # ---------------------------------------------------------------- 工具方法
 
     def _get_llm_provider(self):
-        """根据配置获取 LLM Provider，失败时返回 None。"""
         try:
             if self.llm_provider_id:
                 provider = self.context.get_provider_by_id(self.llm_provider_id)
                 if provider is not None:
                     return provider
-                logger.warning(
-                    f"[sendemojis] 未找到指定的 LLM Provider: {self.llm_provider_id}, 改用默认。"
-                )
-            # 默认 LLM
+                logger.warning(f"[sendemojis] 未找到 Provider: {self.llm_provider_id}, 改用默认")
             if hasattr(self.context, "get_using_provider"):
                 return self.context.get_using_provider()
         except Exception as e:
@@ -164,11 +161,8 @@ class SendEmojisPlugin(Star):
                 parts.append(txt)
         return "".join(parts).strip()
 
-    async def _build_context_text(self, event: AstrMessageEvent, ai_reply: str) -> str:
-        """拼接最近若干轮对话 + 本轮用户消息 + AI 回复。"""
+    async def _build_context_text(self, event: AstrMessageEvent, ai_reply: str = "") -> str:
         lines: list[str] = []
-
-        # 取会话历史（如果能拿到）
         try:
             uid = event.unified_msg_origin
             cm = getattr(self.context, "conversation_manager", None)
@@ -179,13 +173,10 @@ class SendEmojisPlugin(Star):
                     if conv is not None:
                         history = getattr(conv, "history", None) or []
                         if isinstance(history, str):
-                            import json as _json
-
                             try:
-                                history = _json.loads(history)
+                                history = json.loads(history)
                             except Exception:
                                 history = []
-                        # 每轮 = 一问一答 -> 取最后 context_rounds*2 条
                         tail = list(history)[-(self.context_rounds * 2):]
                         for msg in tail:
                             if not isinstance(msg, dict):
@@ -199,34 +190,26 @@ class SendEmojisPlugin(Star):
                             label = "用户" if role == "user" else ("AI" if role == "assistant" else role)
                             lines.append(f"{label}: {content}")
         except Exception as e:
-            logger.debug(f"[sendemojis] 读取历史对话失败（忽略）: {e}")
+            logger.debug(f"[sendemojis] 读取历史对话失败: {e}")
 
-        user_msg = ""
-        try:
-            user_msg = (event.message_str or "").strip()
-        except Exception:
-            user_msg = ""
+        user_msg = (getattr(event, "message_str", "") or "").strip()
         if user_msg:
             lines.append(f"用户: {user_msg}")
         if ai_reply:
             lines.append(f"AI: {ai_reply}")
 
         text = "\n".join(lines).strip()
-        # 限制传给模型的上下文长度
-        max_chars = 800
-        if len(text) > max_chars:
-            text = text[-max_chars:]
+        if len(text) > 800:
+            text = text[-800:]
         return text
 
     async def _pick_emotion_by_llm(self, context_text: str) -> str | None:
-        """让 LLM 从已有情绪类别中选一个。返回情绪名（已校验），否则 None。"""
         emotions = list(self.emoji_map.keys())
         if not emotions:
             return None
 
         provider = self._get_llm_provider()
         if provider is None:
-            logger.debug("[sendemojis] 无可用 LLM Provider，跳过情绪判定。")
             return None
 
         emotion_list_str = ", ".join(emotions)
@@ -257,33 +240,59 @@ class SendEmojisPlugin(Star):
         if not raw:
             return None
 
-        # 规范化，去标点/引号/空白
         cleaned = re.sub(r"[\s\"'`。,.!?！？：:；;()\[\]【】《》<>]+", "", raw).lower()
-        logger.debug(f"[sendemojis] LLM 情绪原始返回={raw!r} -> {cleaned!r}")
 
-        # 精确匹配（忽略大小写）
         for e in emotions:
             if e.lower() == cleaned:
                 return e
-        # 包含匹配（模型可能输出一句话）
         for e in emotions:
             if e.lower() in raw.lower():
                 return e
         return None
 
     def _pick_emoji_file(self, emotion: str | None) -> str | None:
-        """从指定情绪文件夹中随机挑一张；情绪为 None 时从全部中挑。"""
         if emotion and emotion in self.emoji_map and self.emoji_map[emotion]:
             return random.choice(self.emoji_map[emotion])
         if self.fallback_random and self.all_emojis:
             return random.choice(self.all_emojis)
         return None
 
+    # ------------------------------------------------- parallel 模式：预判钩子
+
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, req):
+        """主 LLM 请求时，如果是 parallel 模式，同时发起情绪判定。"""
+        if self.emotion_timing != "parallel":
+            return
+        if self.send_probability <= 0.0 or not self.emoji_map:
+            return
+
+        # 概率判断提前到这里
+        roll = random.random()
+        if roll >= self.send_probability:
+            return
+
+        uid = event.unified_msg_origin
+        # 标记本次事件命中了概率
+        event.set_extra("_sendemojis_triggered", True)
+
+        # 基于用户消息+历史（不含 bot 当前回复）构建上下文并发起情绪判定
+        async def _do_emotion():
+            try:
+                context_text = await self._build_context_text(event, ai_reply="")
+                return await self._pick_emotion_by_llm(context_text)
+            except Exception as e:
+                logger.debug(f"[sendemojis] parallel 情绪预判失败: {e}")
+                return None
+
+        task = asyncio.create_task(_do_emotion())
+        self._emotion_tasks[uid] = task
+
     # ------------------------------------------------------------------ 钩子
 
-    @filter.on_decorating_result()
+    @filter.on_decorating_result(priority=20)
     async def on_ai_reply(self, event: AstrMessageEvent):
-        """在 AI 回复装饰阶段触发，按概率附带发送表情包。"""
+        """AI 回复装饰阶段触发，按概率发送表情包。"""
         if self.send_probability <= 0.0 or not self.emoji_map:
             return
 
@@ -291,7 +300,6 @@ class SendEmojisPlugin(Star):
         if result is None or not getattr(result, "chain", None):
             return
 
-        # 必须是 AI 生成的回复才发（避免对命令回复附带表情）
         try:
             if hasattr(result, "is_llm_result") and not result.is_llm_result():
                 return
@@ -302,139 +310,275 @@ class SendEmojisPlugin(Star):
         if not ai_reply:
             return
 
-        # 概率判断
-        roll = random.random()
-        if roll >= self.send_probability:
-            logger.debug(
-                f"[sendemojis] 未命中概率: roll={roll:.3f} >= p={self.send_probability:.3f}"
-            )
-            return
-        logger.debug(
-            f"[sendemojis] 命中概率: roll={roll:.3f} < p={self.send_probability:.3f}"
-        )
+        uid = event.unified_msg_origin
 
-        # 异步发送，避免阻塞当前回复
-        asyncio.create_task(self._decide_and_send(event, ai_reply))
+        if self.emotion_timing == "parallel":
+            # parallel 模式：检查是否在 on_llm_request 中命中了概率
+            if not event.get_extra("_sendemojis_triggered"):
+                return
+            # 获取预判结果
+            emotion = await self._get_parallel_emotion(uid)
+        else:
+            # wait 模式：在这里判断概率并调用 LLM
+            roll = random.random()
+            if roll >= self.send_probability:
+                return
+            emotion = None  # 稍后在 _process_emoji_with_emotion 中判定
 
-    async def _decide_and_send(self, event: AstrMessageEvent, ai_reply: str) -> None:
+        # 检测引用标签
+        has_reply_tag = "[reply:" in ai_reply
+
+        if self.emotion_timing == "parallel":
+            # parallel 模式：已有 emotion 结果，直接用
+            if self.emoji_position in ("random", "before"):
+                await self._process_emoji_with_emotion(event, ai_reply, emotion)
+            elif has_reply_tag:
+                await self._process_emoji_with_emotion_chain_end(event, emotion)
+            else:
+                asyncio.create_task(self._send_emoji_directly(event, emotion))
+        else:
+            # wait 模式：需要调辅助 LLM
+            if self.emoji_position in ("random", "before"):
+                await self._process_emoji(event, ai_reply)
+            elif has_reply_tag:
+                await self._process_emoji_into_chain_end(event, ai_reply)
+            else:
+                asyncio.create_task(self._process_emoji(event, ai_reply))
+
+    async def _get_parallel_emotion(self, uid: str) -> str | None:
+        """获取 parallel 模式下预判的情绪结果。"""
+        task = self._emotion_tasks.pop(uid, None)
+        if task is None:
+            return None
         try:
-            context_text = await self._build_context_text(event, ai_reply)
-            emotion = await self._pick_emotion_by_llm(context_text)
-            logger.debug(f"[sendemojis] 判定情绪: {emotion}")
+            return await task
+        except Exception:
+            return None
 
+    # ------------------------------------------- parallel 模式的发送方法
+
+    async def _send_emoji_directly(self, event: AstrMessageEvent, emotion: str | None) -> None:
+        """parallel + after：直接用预判结果发送表情包。"""
+        try:
             emoji_path = self._pick_emoji_file(emotion)
             if not emoji_path or not os.path.isfile(emoji_path):
-                logger.debug("[sendemojis] 没有可发送的表情包，跳过。")
                 return
-
-            chain = MessageChain([Image(file=emoji_path)])
-            await event.send(chain)
-
+            await event.send(MessageChain([Image(file=emoji_path)]))
             emoji_filename = os.path.basename(emoji_path)
             emotion_label = emotion or "random"
-            logger.info(
-                f"[sendemojis] 已发送表情包: emotion={emotion_label}, file={emoji_filename}"
-            )
-
-            # Fake tool call 注入对话历史，让主 LLM 知道自己发送了表情包
+            logger.info(f"[sendemojis] 表情包发送(parallel+after): {emotion_label}/{emoji_filename}")
             if self.inject_fake_tool_call:
-                await self._inject_fake_tool_call(event, emotion_label, emoji_filename)
-
+                await self._save_fake_tool_call(event, emotion_label, emoji_filename)
         except Exception as e:
             logger.error(f"[sendemojis] 发送表情包失败: {e}", exc_info=True)
 
-    async def _inject_fake_tool_call(
-        self, event: AstrMessageEvent, emotion: str, filename: str
+    async def _process_emoji_with_emotion(
+        self, event: AstrMessageEvent, ai_reply: str, emotion: str | None
     ) -> None:
-        """将表情包发送行为以 fake tool call 形式写入对话历史。"""
+        """parallel + before/random：用预判结果插入 chain。"""
+        try:
+            emoji_path = self._pick_emoji_file(emotion)
+            if not emoji_path or not os.path.isfile(emoji_path):
+                return
+            emoji_filename = os.path.basename(emoji_path)
+            emotion_label = emotion or "random"
+
+            if self.emoji_position == "random":
+                self._insert_emoji_into_chain(event, emoji_path, emotion_label, emoji_filename)
+            elif self.emoji_position == "before":
+                result = event.get_result()
+                if result and getattr(result, "chain", None):
+                    result.chain.insert(0, Image(file=emoji_path))
+                    logger.info(f"[sendemojis] 表情包插入句前(parallel): {emotion_label}/{emoji_filename}")
+
+            if self.inject_fake_tool_call:
+                await self._save_fake_tool_call(event, emotion_label, emoji_filename)
+        except Exception as e:
+            logger.error(f"[sendemojis] 发送表情包失败: {e}", exc_info=True)
+
+    async def _process_emoji_with_emotion_chain_end(
+        self, event: AstrMessageEvent, emotion: str | None
+    ) -> None:
+        """parallel + 引用场景：用预判结果追加到 chain 末尾。"""
+        try:
+            emoji_path = self._pick_emoji_file(emotion)
+            if not emoji_path or not os.path.isfile(emoji_path):
+                return
+            emoji_filename = os.path.basename(emoji_path)
+            emotion_label = emotion or "random"
+
+            result = event.get_result()
+            if result and getattr(result, "chain", None):
+                result.chain.append(Image(file=emoji_path))
+                logger.info(f"[sendemojis] 表情包追加chain末尾(parallel): {emotion_label}/{emoji_filename}")
+
+            if self.inject_fake_tool_call:
+                await self._save_fake_tool_call(event, emotion_label, emoji_filename)
+        except Exception as e:
+            logger.error(f"[sendemojis] 追加表情包失败: {e}", exc_info=True)
+
+    # ------------------------------------------- wait 模式的发送方法
+
+    async def _process_emoji(self, event: AstrMessageEvent, ai_reply: str) -> None:
+        try:
+            context_text = await self._build_context_text(event, ai_reply)
+            emotion = await self._pick_emotion_by_llm(context_text)
+            emoji_path = self._pick_emoji_file(emotion)
+            if not emoji_path or not os.path.isfile(emoji_path):
+                return
+
+            emoji_filename = os.path.basename(emoji_path)
+            emotion_label = emotion or "random"
+
+            if self.emoji_position == "random":
+                self._insert_emoji_into_chain(event, emoji_path, emotion_label, emoji_filename)
+            elif self.emoji_position == "before":
+                result = event.get_result()
+                if result and getattr(result, "chain", None):
+                    result.chain.insert(0, Image(file=emoji_path))
+                    logger.info(f"[sendemojis] 表情包插入句前: {emotion_label}/{emoji_filename}")
+            else:
+                await event.send(MessageChain([Image(file=emoji_path)]))
+                logger.info(f"[sendemojis] 表情包发送(句后): {emotion_label}/{emoji_filename}")
+
+            if self.inject_fake_tool_call:
+                await self._save_fake_tool_call(event, emotion_label, emoji_filename)
+        except Exception as e:
+            logger.error(f"[sendemojis] 发送表情包失败: {e}", exc_info=True)
+
+    async def _process_emoji_into_chain_end(self, event: AstrMessageEvent, ai_reply: str) -> None:
+        try:
+            context_text = await self._build_context_text(event, ai_reply)
+            emotion = await self._pick_emotion_by_llm(context_text)
+            emoji_path = self._pick_emoji_file(emotion)
+            if not emoji_path or not os.path.isfile(emoji_path):
+                return
+
+            emoji_filename = os.path.basename(emoji_path)
+            emotion_label = emotion or "random"
+
+            result = event.get_result()
+            if result and getattr(result, "chain", None):
+                result.chain.append(Image(file=emoji_path))
+                logger.info(f"[sendemojis] 表情包追加到chain末尾: {emotion_label}/{emoji_filename}")
+
+            if self.inject_fake_tool_call:
+                await self._save_fake_tool_call(event, emotion_label, emoji_filename)
+        except Exception as e:
+            logger.error(f"[sendemojis] 追加表情包失败: {e}", exc_info=True)
+
+    # --------------------------------------------------------- 穿插发送逻辑
+
+    def _insert_emoji_into_chain(
+        self, event: AstrMessageEvent, emoji_path: str, emotion_label: str, emoji_filename: str
+    ) -> None:
+        result = event.get_result()
+        if result is None or not getattr(result, "chain", None):
+            return
+
+        segments = self._split_chain_to_segments(result.chain)
+        if not segments:
+            return
+
+        total = len(segments)
+        pos = random.randint(0, total)
+        segments.insert(pos, [Image(file=emoji_path)])
+
+        new_chain = []
+        for seg in segments:
+            new_chain.extend(seg)
+        result.chain = new_chain
+
+        logger.info(f"[sendemojis] 表情包插入chain: {emotion_label}/{emoji_filename}, 位置={pos}/{total}")
+
+    def _split_chain_to_segments(self, chain: list) -> list[list]:
+        segments: list[list] = []
+        if self.segment_separator:
+            try:
+                pattern = re.compile(self.segment_separator)
+            except re.error as e:
+                logger.warning(f"[sendemojis] segment_separator 正则无效: {e}")
+                return self._split_by_default_punctuation(chain)
+            for comp in chain:
+                if isinstance(comp, Plain) and comp.text:
+                    for part in pattern.findall(comp.text):
+                        if part.strip():
+                            segments.append([Plain(part.strip())])
+                else:
+                    segments.append([comp])
+            return segments
+        return self._split_by_default_punctuation(chain)
+
+    def _split_by_default_punctuation(self, chain: list) -> list[list]:
+        segments: list[list] = []
+        pattern = re.compile(r"(?<=[。？！~…\?\!])")
+        for comp in chain:
+            if isinstance(comp, Plain) and comp.text:
+                for part in pattern.split(comp.text):
+                    if part.strip():
+                        segments.append([Plain(part.strip())])
+            else:
+                segments.append([comp])
+        return segments
+
+    # -------------------------------------------------------- Fake Tool Call
+
+    async def _save_fake_tool_call(self, event: AstrMessageEvent, emotion: str, filename: str) -> None:
+        asyncio.create_task(self._write_to_db(event, f"emoji_{uuid.uuid4().hex[:12]}", emotion, filename))
+
+    async def _write_to_db(self, event: AstrMessageEvent, call_id: str, emotion: str, filename: str) -> None:
+        await asyncio.sleep(8)
         try:
             cm = getattr(self.context, "conversation_manager", None)
             if cm is None:
                 return
-
             uid = event.unified_msg_origin
             conv_id = await cm.get_curr_conversation_id(uid)
             if not conv_id:
                 return
-
-            # 生成唯一 tool_call_id
-            call_id = f"emoji_{uuid.uuid4().hex[:12]}"
-
-            # assistant 发起的 tool_call
-            assistant_msg = {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": "send_emoji",
-                            "arguments": json.dumps(
-                                {"emotion": emotion, "file": filename},
-                                ensure_ascii=False,
-                            ),
-                        },
-                    }
-                ],
-            }
-
-            # tool 返回结果
-            tool_msg = {
-                "role": "tool",
-                "tool_call_id": call_id,
-                "name": "send_emoji",
-                "content": f"已向用户发送了一张「{emotion}」的表情包（{filename}）。",
-            }
-
-            # 读取当前对话历史并追加
             conv = await cm.get_conversation(uid, conv_id)
             if conv is None:
                 return
-
             history = getattr(conv, "history", None) or []
             if isinstance(history, str):
                 try:
                     history = json.loads(history)
                 except Exception:
                     history = []
-
             history = list(history)
-            history.append(assistant_msg)
-            history.append(tool_msg)
-
-            await cm.update_conversation(
-                unified_msg_origin=uid,
-                conversation_id=conv_id,
-                history=history,
-            )
-            logger.debug(f"[sendemojis] 已注入 fake tool call 到对话历史: {call_id}")
-
+            history.append({
+                "role": "assistant", "content": None,
+                "tool_calls": [{"id": call_id, "type": "function", "function": {
+                    "name": "send_emoji",
+                    "arguments": json.dumps({"emotion": emotion, "file": filename}, ensure_ascii=False),
+                }}],
+            })
+            history.append({
+                "role": "tool", "tool_call_id": call_id, "name": "send_emoji",
+                "content": f"已向用户发送了一张「{emotion}」的表情包（{filename}）。",
+            })
+            await cm.update_conversation(unified_msg_origin=uid, conversation_id=conv_id, history=history)
         except Exception as e:
-            logger.debug(f"[sendemojis] 注入 fake tool call 失败（不影响发送）: {e}")
+            logger.warning(f"[sendemojis] fake tool call 写入失败: {e}")
 
     # ------------------------------------------------------------------ 指令
 
     @filter.command("reload_emojis")
     async def cmd_reload_emojis(self, event: AstrMessageEvent):
-        """手动重新扫描表情包目录。"""
         self._load_runtime_config()
         self._scan_emojis()
         emotions = ", ".join(f"{k}({len(v)})" for k, v in self.emoji_map.items()) or "无"
-        yield event.plain_result(
-            f"表情包已重载\n目录: {self.emojis_path}\n情绪及数量: {emotions}\n总计: {len(self.all_emojis)} 张"
-        )
+        yield event.plain_result(f"表情包已重载\n情绪: {emotions}\n总计: {len(self.all_emojis)} 张")
 
     @filter.command("emojis_status")
     async def cmd_status(self, event: AstrMessageEvent):
-        """查看当前表情包配置与扫描结果。"""
         emotions = ", ".join(f"{k}({len(v)})" for k, v in self.emoji_map.items()) or "无"
         yield event.plain_result(
             "📦 表情包插件状态\n"
             f"- 概率: {self.send_probability}\n"
-            f"- 目录: {self.emojis_path}\n"
-            f"- LLM ID: {self.llm_provider_id or '<默认>'}\n"
-            f"- 上下文轮数: {self.context_rounds}\n"
-            f"- 情绪分类: {emotions}\n"
-            f"- 总图片数: {len(self.all_emojis)}"
+            f"- 位置: {self.emoji_position}\n"
+            f"- 时机: {self.emotion_timing}\n"
+            f"- LLM: {self.llm_provider_id or '默认'}\n"
+            f"- 情绪: {emotions}\n"
+            f"- 总数: {len(self.all_emojis)}"
         )

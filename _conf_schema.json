@@ -6,40 +6,60 @@
     "default": 0.3
   },
   "emojis_path": {
-    "description": "表情包主文件夹路径",
+    "description": "表情包目录",
     "type": "string",
-    "hint": "表情包根目录。支持绝对路径或相对插件目录的相对路径；留空则使用插件目录下的 emojis/。根目录下每个子文件夹代表一种情绪（例如 happy、sad、angry 等），子文件夹内放置对应表情图片。",
+    "hint": "支持绝对路径或相对路径，留空使用插件目录下的 emojis/。子文件夹名即情绪类别。",
     "default": ""
   },
   "llm_provider_id": {
     "description": "情绪判定模型",
     "type": "string",
     "_special": "select_provider",
-    "hint": "用于分析上下文情绪的 LLM Provider ID。留空使用 AstrBot 默认 LLM。可在 AstrBot 后台「LLM 配置」中查看已有 Provider ID。",
+    "hint": "用于判断情绪的 LLM Provider ID，留空使用默认 LLM。",
+    "default": ""
+  },
+  "emotion_timing": {
+    "description": "情绪判定时机",
+    "type": "string",
+    "hint": "parallel：与主 LLM 同时请求（不含 bot 当前回复，最快）。wait：等主 LLM 返回后再判断（含 bot 回复，更准确但慢）。",
+    "default": "parallel",
+    "options": ["parallel", "wait"]
+  },
+  "emoji_position": {
+    "description": "表情包位置",
+    "type": "string",
+    "hint": "before：文字之前。after：文字之后（parallel+after 最快）。random：随机穿插在分段之间。",
+    "default": "after",
+    "options": ["before", "after", "random"]
+  },
+  "segment_separator": {
+    "description": "分段正则",
+    "type": "string",
+    "hint": "仅 random 模式生效。用 findall 提取匹配片段作为分段。例如用 $ 分隔则填 [^$\\\\]+。留空按句末标点分段。",
     "default": ""
   },
   "context_rounds": {
     "description": "上下文轮数",
     "type": "int",
-    "hint": "传给模型用于情绪判定的最近对话轮数（一问一答算一轮）。",
-    "default": 3
+    "hint": "传给情绪判定模型的最近对话轮数。",
+    "default": 5
   },
   "llm_timeout": {
-    "description": "模型调用超时 (秒)",
+    "description": "模型超时 (秒)",
     "type": "int",
-    "hint": "情绪判定模型调用的超时时间，超时则视为判定失败。",
-    "default": 30
+    "hint": "情绪判定超时时间，超时视为失败。",
+    "default": 15
   },
   "fallback_random_on_fail": {
     "description": "判定失败时随机发送",
     "type": "bool",
-    "hint": "当模型未返回有效情绪或调用失败时，是否从全部表情包中随机选一张发送。关闭则不发。",
+    "hint": "情绪判定失败时是否从全部表情包中随机选一张发送。",
     "default": true
   },
   "inject_fake_tool_call": {
     "description": "注入 Fake Tool Call",
     "type": "bool",
-    "hint": "开启后会将表情包发送行为以伪装工具调用的形式写入对话历史，让主 LLM 知道自己发送了表情包。注意：由于时序竞争，注入不一定每次都成功。",
+    "hint": "将表情包发送写入对话历史，让主 LLM 知道自己发了表情包。",
     "default": false
   }
 }
