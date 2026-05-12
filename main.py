@@ -594,10 +594,29 @@ class SendEmojisPlugin(Star):
                 except Exception:
                     history = []
             history = list(history)
-            history.append({
-                "role": "assistant",
-                "content": f"[已向用户发送了一张「{emotion}」情绪的表情包（{filename}）]",
-            })
+
+            # 追加到最后一条 assistant 消息末尾，不新增消息条目（避免破坏 user/assistant 交替结构）
+            notify_text = f"\n[已发送「{emotion}」表情包（{filename}）]"
+            for i in range(len(history) - 1, -1, -1):
+                msg = history[i]
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    continue
+                content = msg.get("content")
+                if not content:
+                    continue
+
+                if isinstance(content, str):
+                    # 简单文本回复，直接追加
+                    history[i]["content"] = content + notify_text
+                elif isinstance(content, list):
+                    # 结构化内容（含 think/text ContentPart），追加一个 TextPart
+                    history[i]["content"].append({"type": "text", "text": notify_text})
+                else:
+                    continue
+                break
+            else:
+                return  # 没找到 assistant 消息，跳过
+
             await cm.update_conversation(unified_msg_origin=uid, conversation_id=conv_id, history=history)
         except Exception as e:
             logger.warning(f"[sendemojis] 表情包记录写入失败: {e}")

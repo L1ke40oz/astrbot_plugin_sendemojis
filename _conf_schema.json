@@ -42,7 +42,7 @@
     "description": "上下文轮数",
     "type": "int",
     "hint": "传给情绪判定模型的最近对话轮数。",
-    "default": 5
+    "default": 3
   },
   "llm_timeout": {
     "description": "模型超时 (秒)",
