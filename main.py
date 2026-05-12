@@ -6,7 +6,7 @@ astrbot_plugin_sendemojis
 2. 重载时自动扫描表情包主目录下的情绪子文件夹；
 3. 命中时将当前上下文交给配置的 LLM，由其判断情绪类别，
    再从对应子文件夹随机挑一张表情图片发送给用户。
-4. 可选将发送记录写入对话历史，让主 LLM 知道自己发送了表情包。
+4. 可选在下一轮 LLM 请求时注入表情包发送记录（内存方式，不写 DB）。
 5. emoji_position 控制表情包位置：before/after/random。
 6. emotion_timing 控制情绪判定时机：parallel（与主LLM并行，最快）/ wait（等主LLM返回后，更准）。
 """
@@ -47,6 +47,10 @@ class SendEmojisPlugin(Star):
 
         # parallel 模式：缓存预判结果 {uid: asyncio.Task}
         self._emotion_tasks: dict[str, asyncio.Task] = {}
+
+        # 内存中记录最近发送的表情包，用于下一轮注入给 LLM（不写 DB）
+        # {uid: [{"emotion": "...", "filename": "..."}, ...]}
+        self._recent_emoji_records: dict[str, list[dict[str, str]]] = {}
 
     # ---------------------------------------------------------------- 生命周期
 
@@ -260,7 +264,27 @@ class SendEmojisPlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req):
-        """主 LLM 请求时，如果是 parallel 模式，同时发起情绪判定。"""
+        """主 LLM 请求时：
+        1. 如果有上一轮的表情包记录，注入临时 context 告知 LLM；
+        2. 如果是 parallel 模式，同时发起情绪判定。
+        """
+        uid = event.unified_msg_origin
+
+        # 注入上一轮发送的表情包记录（标记 _no_save，不持久化）
+        records = self._recent_emoji_records.pop(uid, None)
+        if records and self.notify_history:
+            lines = [f"[已发送「{r['emotion']}」表情包（{r['filename']}）]" for r in records]
+            notify_text = "\n".join(lines)
+            # 作为 assistant 消息注入到 contexts 末尾，标记不持久化
+            inject_msg = {
+                "role": "assistant",
+                "content": f"[系统提示：你在上一轮回复后发送了以下表情包]\n{notify_text}",
+                "_no_save": True,
+            }
+            if hasattr(req, "contexts") and isinstance(req.contexts, list):
+                req.contexts.append(inject_msg)
+
+        # parallel 模式的情绪预判逻辑
         if self.emotion_timing != "parallel":
             return
         if self.send_probability <= 0.0 or not self.emoji_map:
@@ -271,7 +295,6 @@ class SendEmojisPlugin(Star):
         if roll >= self.send_probability:
             return
 
-        uid = event.unified_msg_origin
         # 标记本次事件命中了概率
         event.set_extra("_sendemojis_triggered", True)
 
@@ -367,7 +390,7 @@ class SendEmojisPlugin(Star):
             emotion_label = emotion or "random"
             logger.info(f"[sendemojis] 表情包发送(parallel+after): {emotion_label}/{emoji_filename}")
             if self.notify_history:
-                await self._notify_history(event, emotion_label, emoji_filename)
+                self._record_emoji_sent(event, emotion_label, emoji_filename)
         except Exception as e:
             logger.error(f"[sendemojis] 发送表情包失败: {e}", exc_info=True)
 
@@ -391,7 +414,7 @@ class SendEmojisPlugin(Star):
                     logger.info(f"[sendemojis] 表情包插入句前(parallel): {emotion_label}/{emoji_filename}")
 
             if self.notify_history:
-                await self._notify_history(event, emotion_label, emoji_filename)
+                self._record_emoji_sent(event, emotion_label, emoji_filename)
         except Exception as e:
             logger.error(f"[sendemojis] 发送表情包失败: {e}", exc_info=True)
 
@@ -412,7 +435,7 @@ class SendEmojisPlugin(Star):
                 logger.info(f"[sendemojis] 表情包追加chain末尾(parallel): {emotion_label}/{emoji_filename}")
 
             if self.notify_history:
-                await self._notify_history(event, emotion_label, emoji_filename)
+                self._record_emoji_sent(event, emotion_label, emoji_filename)
         except Exception as e:
             logger.error(f"[sendemojis] 追加表情包失败: {e}", exc_info=True)
 
@@ -441,7 +464,7 @@ class SendEmojisPlugin(Star):
                 logger.info(f"[sendemojis] 表情包发送(句后): {emotion_label}/{emoji_filename}")
 
             if self.notify_history:
-                await self._notify_history(event, emotion_label, emoji_filename)
+                self._record_emoji_sent(event, emotion_label, emoji_filename)
         except Exception as e:
             logger.error(f"[sendemojis] 发送表情包失败: {e}", exc_info=True)
 
@@ -462,7 +485,7 @@ class SendEmojisPlugin(Star):
                 logger.info(f"[sendemojis] 表情包追加到chain末尾: {emotion_label}/{emoji_filename}")
 
             if self.notify_history:
-                await self._notify_history(event, emotion_label, emoji_filename)
+                self._record_emoji_sent(event, emotion_label, emoji_filename)
         except Exception as e:
             logger.error(f"[sendemojis] 追加表情包失败: {e}", exc_info=True)
 
@@ -484,8 +507,6 @@ class SendEmojisPlugin(Star):
         pos = random.randint(0, segment_count)
 
         # 将 Image 插入到 chain 中对应位置
-        # 对于 pos=0 插入最前面，pos=segment_count 插入最后面
-        # 中间位置需要拆分 Plain 文本
         new_chain = self._build_chain_with_emoji_at(result.chain, pos, emoji_path)
         result.chain = new_chain
 
@@ -546,8 +567,6 @@ class SendEmojisPlugin(Star):
                     seg_count = max(1, len([p for p in parts if p.strip()]))
 
                 if current_pos + seg_count >= target_pos and current_pos < target_pos:
-                    # Image 需要插入到这个 Plain 内部的某个位置
-                    # 但我们不拆分文本，直接在这个 comp 后面插入 Image
                     new_chain.append(comp)
                     new_chain.append(Image(file=emoji_path))
                     current_pos += seg_count
@@ -559,7 +578,6 @@ class SendEmojisPlugin(Star):
                 current_pos += 1
 
             if current_pos >= target_pos and Image(file=emoji_path) not in new_chain:
-                # 安全兜底
                 pass
 
         # 如果还没插入（target_pos >= total），追加到末尾
@@ -568,58 +586,14 @@ class SendEmojisPlugin(Star):
 
         return new_chain
 
-    # ---------------------------------------------------- 对话历史记录
+    # ---------------------------------------------------- 对话历史记录（内存注入）
 
-    async def _notify_history(self, event: AstrMessageEvent, emotion: str, filename: str) -> None:
-        """延迟写入一条 assistant 消息到对话历史，告知 LLM 它发送了表情包。"""
-        asyncio.create_task(self._write_to_db(event, emotion, filename))
-
-    async def _write_to_db(self, event: AstrMessageEvent, emotion: str, filename: str) -> None:
-        await asyncio.sleep(8)
-        try:
-            cm = getattr(self.context, "conversation_manager", None)
-            if cm is None:
-                return
-            uid = event.unified_msg_origin
-            conv_id = await cm.get_curr_conversation_id(uid)
-            if not conv_id:
-                return
-            conv = await cm.get_conversation(uid, conv_id)
-            if conv is None:
-                return
-            history = getattr(conv, "history", None) or []
-            if isinstance(history, str):
-                try:
-                    history = json.loads(history)
-                except Exception:
-                    history = []
-            history = list(history)
-
-            # 追加到最后一条 assistant 消息末尾，不新增消息条目（避免破坏 user/assistant 交替结构）
-            notify_text = f"\n[已发送「{emotion}」表情包（{filename}）]"
-            for i in range(len(history) - 1, -1, -1):
-                msg = history[i]
-                if not isinstance(msg, dict) or msg.get("role") != "assistant":
-                    continue
-                content = msg.get("content")
-                if not content:
-                    continue
-
-                if isinstance(content, str):
-                    # 简单文本回复，直接追加
-                    history[i]["content"] = content + notify_text
-                elif isinstance(content, list):
-                    # 结构化内容（含 think/text ContentPart），追加一个 TextPart
-                    history[i]["content"].append({"type": "text", "text": notify_text})
-                else:
-                    continue
-                break
-            else:
-                return  # 没找到 assistant 消息，跳过
-
-            await cm.update_conversation(unified_msg_origin=uid, conversation_id=conv_id, history=history)
-        except Exception as e:
-            logger.warning(f"[sendemojis] 表情包记录写入失败: {e}")
+    def _record_emoji_sent(self, event: AstrMessageEvent, emotion: str, filename: str) -> None:
+        """记录本轮发送的表情包到内存，下一轮 LLM 请求时注入。"""
+        uid = event.unified_msg_origin
+        if uid not in self._recent_emoji_records:
+            self._recent_emoji_records[uid] = []
+        self._recent_emoji_records[uid].append({"emotion": emotion, "filename": filename})
 
     # ------------------------------------------------------------------ 指令
 

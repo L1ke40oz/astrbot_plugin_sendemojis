@@ -57,9 +57,9 @@
     "default": true
   },
   "notify_history": {
-    "description": "写入对话历史",
+    "description": "告知 LLM 发送记录",
     "type": "bool",
-    "hint": "发送表情包后在对话历史中追加一条记录，让主 LLM 知道自己发了表情包。",
+    "hint": "发送表情包后记录到内存，下一轮对话时临时注入让主 LLM 知道自己发了表情包。",
     "default": true
   }
 }
