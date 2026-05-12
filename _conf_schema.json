@@ -21,7 +21,7 @@
   "emotion_timing": {
     "description": "情绪判定时机",
     "type": "string",
-    "hint": "parallel：与主 LLM 同时请求（不含 bot 当前回复，最快）。wait：等主 LLM 返回后再判断（含 bot 回复，更准确但慢）。",
+    "hint": "parallel：与主 LLM 同时请求（不含 bot 当前回复，最快）。wait：等主 LLM 返回后再判断（含 bot 当前回复，判定更准确但慢）。",
     "default": "parallel",
     "options": ["parallel", "wait"]
   },
@@ -56,10 +56,10 @@
     "hint": "情绪判定失败时是否从全部表情包中随机选一张发送。",
     "default": true
   },
-  "inject_fake_tool_call": {
-    "description": "注入 Fake Tool Call",
+  "notify_history": {
+    "description": "写入对话历史",
     "type": "bool",
-    "hint": "将表情包发送写入对话历史，让主 LLM 知道自己发了表情包。",
-    "default": false
+    "hint": "发送表情包后在对话历史中追加一条记录，让主 LLM 知道自己发了表情包。",
+    "default": true
   }
 }

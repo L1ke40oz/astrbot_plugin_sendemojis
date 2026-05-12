@@ -6,7 +6,7 @@ astrbot_plugin_sendemojis
 2. 重载时自动扫描表情包主目录下的情绪子文件夹；
 3. 命中时将当前上下文交给配置的 LLM，由其判断情绪类别，
    再从对应子文件夹随机挑一张表情图片发送给用户。
-4. 可选以 fake tool call 形式注入对话历史，让主 LLM 知道自己发送了表情包。
+4. 可选将发送记录写入对话历史，让主 LLM 知道自己发送了表情包。
 5. emoji_position 控制表情包位置：before/after/random。
 6. emotion_timing 控制情绪判定时机：parallel（与主LLM并行，最快）/ wait（等主LLM返回后，更准）。
 """
@@ -18,7 +18,6 @@ import json
 import os
 import random
 import re
-import uuid
 from typing import Any
 
 from astrbot.api import logger
@@ -89,7 +88,7 @@ class SendEmojisPlugin(Star):
         self.context_rounds: int = int(cfg.get("context_rounds", 3) or 3)
         self.llm_timeout: int = int(cfg.get("llm_timeout", 15) or 15)
         self.fallback_random: bool = bool(cfg.get("fallback_random_on_fail", True))
-        self.inject_fake_tool_call: bool = bool(cfg.get("inject_fake_tool_call", False))
+        self.notify_history: bool = bool(cfg.get("notify_history", True))
 
         pos = str(cfg.get("emoji_position", "after") or "after").strip().lower()
         self.emoji_position: str = pos if pos in ("before", "after", "random") else "after"
@@ -367,8 +366,8 @@ class SendEmojisPlugin(Star):
             emoji_filename = os.path.basename(emoji_path)
             emotion_label = emotion or "random"
             logger.info(f"[sendemojis] 表情包发送(parallel+after): {emotion_label}/{emoji_filename}")
-            if self.inject_fake_tool_call:
-                await self._save_fake_tool_call(event, emotion_label, emoji_filename)
+            if self.notify_history:
+                await self._notify_history(event, emotion_label, emoji_filename)
         except Exception as e:
             logger.error(f"[sendemojis] 发送表情包失败: {e}", exc_info=True)
 
@@ -391,8 +390,8 @@ class SendEmojisPlugin(Star):
                     result.chain.insert(0, Image(file=emoji_path))
                     logger.info(f"[sendemojis] 表情包插入句前(parallel): {emotion_label}/{emoji_filename}")
 
-            if self.inject_fake_tool_call:
-                await self._save_fake_tool_call(event, emotion_label, emoji_filename)
+            if self.notify_history:
+                await self._notify_history(event, emotion_label, emoji_filename)
         except Exception as e:
             logger.error(f"[sendemojis] 发送表情包失败: {e}", exc_info=True)
 
@@ -412,8 +411,8 @@ class SendEmojisPlugin(Star):
                 result.chain.append(Image(file=emoji_path))
                 logger.info(f"[sendemojis] 表情包追加chain末尾(parallel): {emotion_label}/{emoji_filename}")
 
-            if self.inject_fake_tool_call:
-                await self._save_fake_tool_call(event, emotion_label, emoji_filename)
+            if self.notify_history:
+                await self._notify_history(event, emotion_label, emoji_filename)
         except Exception as e:
             logger.error(f"[sendemojis] 追加表情包失败: {e}", exc_info=True)
 
@@ -441,8 +440,8 @@ class SendEmojisPlugin(Star):
                 await event.send(MessageChain([Image(file=emoji_path)]))
                 logger.info(f"[sendemojis] 表情包发送(句后): {emotion_label}/{emoji_filename}")
 
-            if self.inject_fake_tool_call:
-                await self._save_fake_tool_call(event, emotion_label, emoji_filename)
+            if self.notify_history:
+                await self._notify_history(event, emotion_label, emoji_filename)
         except Exception as e:
             logger.error(f"[sendemojis] 发送表情包失败: {e}", exc_info=True)
 
@@ -462,8 +461,8 @@ class SendEmojisPlugin(Star):
                 result.chain.append(Image(file=emoji_path))
                 logger.info(f"[sendemojis] 表情包追加到chain末尾: {emotion_label}/{emoji_filename}")
 
-            if self.inject_fake_tool_call:
-                await self._save_fake_tool_call(event, emotion_label, emoji_filename)
+            if self.notify_history:
+                await self._notify_history(event, emotion_label, emoji_filename)
         except Exception as e:
             logger.error(f"[sendemojis] 追加表情包失败: {e}", exc_info=True)
 
@@ -476,57 +475,106 @@ class SendEmojisPlugin(Star):
         if result is None or not getattr(result, "chain", None):
             return
 
-        segments = self._split_chain_to_segments(result.chain)
-        if not segments:
-            return
+        # 计算分段数来决定插入位置，但不修改原始文本
+        segment_count = self._count_segments(result.chain)
+        if segment_count <= 0:
+            segment_count = 1
 
-        total = len(segments)
-        pos = random.randint(0, total)
-        segments.insert(pos, [Image(file=emoji_path)])
+        # 随机选择插入位置：0=最前, segment_count=最后
+        pos = random.randint(0, segment_count)
 
-        new_chain = []
-        for seg in segments:
-            new_chain.extend(seg)
+        # 将 Image 插入到 chain 中对应位置
+        # 对于 pos=0 插入最前面，pos=segment_count 插入最后面
+        # 中间位置需要拆分 Plain 文本
+        new_chain = self._build_chain_with_emoji_at(result.chain, pos, emoji_path)
         result.chain = new_chain
 
-        logger.info(f"[sendemojis] 表情包插入chain: {emotion_label}/{emoji_filename}, 位置={pos}/{total}")
+        logger.info(f"[sendemojis] 表情包插入chain: {emotion_label}/{emoji_filename}, 位置={pos}/{segment_count}")
 
-    def _split_chain_to_segments(self, chain: list) -> list[list]:
-        segments: list[list] = []
+    def _count_segments(self, chain: list) -> int:
+        """计算 chain 中的分段数（不修改原始内容）。"""
+        count = 0
         if self.segment_separator:
             try:
                 pattern = re.compile(self.segment_separator)
-            except re.error as e:
-                logger.warning(f"[sendemojis] segment_separator 正则无效: {e}")
-                return self._split_by_default_punctuation(chain)
+            except re.error:
+                return max(1, len(chain))
             for comp in chain:
                 if isinstance(comp, Plain) and comp.text:
-                    for part in pattern.findall(comp.text):
-                        if part.strip():
-                            segments.append([Plain(part.strip())])
+                    parts = pattern.findall(comp.text)
+                    count += max(1, len([p for p in parts if p.strip()]))
                 else:
-                    segments.append([comp])
-            return segments
-        return self._split_by_default_punctuation(chain)
+                    count += 1
+            return count
 
-    def _split_by_default_punctuation(self, chain: list) -> list[list]:
-        segments: list[list] = []
+        # 默认标点分段
         pattern = re.compile(r"(?<=[。？！~…\?\!])")
         for comp in chain:
             if isinstance(comp, Plain) and comp.text:
-                for part in pattern.split(comp.text):
-                    if part.strip():
-                        segments.append([Plain(part.strip())])
+                parts = pattern.split(comp.text)
+                count += max(1, len([p for p in parts if p.strip()]))
             else:
-                segments.append([comp])
-        return segments
+                count += 1
+        return count
 
-    # -------------------------------------------------------- Fake Tool Call
+    def _build_chain_with_emoji_at(self, chain: list, target_pos: int, emoji_path: str) -> list:
+        """在第 target_pos 个分段位置插入 Image，保持原始文本不变。"""
+        if target_pos == 0:
+            return [Image(file=emoji_path)] + list(chain)
 
-    async def _save_fake_tool_call(self, event: AstrMessageEvent, emotion: str, filename: str) -> None:
-        asyncio.create_task(self._write_to_db(event, f"emoji_{uuid.uuid4().hex[:12]}", emotion, filename))
+        # 遍历 chain，计数分段，在到达 target_pos 时插入 Image
+        new_chain = []
+        current_pos = 0
 
-    async def _write_to_db(self, event: AstrMessageEvent, call_id: str, emotion: str, filename: str) -> None:
+        if self.segment_separator:
+            try:
+                pattern = re.compile(self.segment_separator)
+            except re.error:
+                pattern = None
+        else:
+            pattern = None
+
+        split_pattern = re.compile(r"(?<=[。？！~…\?\!])") if pattern is None else None
+
+        for comp in chain:
+            if isinstance(comp, Plain) and comp.text:
+                if pattern:
+                    parts = pattern.findall(comp.text)
+                    seg_count = max(1, len([p for p in parts if p.strip()]))
+                else:
+                    parts = split_pattern.split(comp.text)
+                    seg_count = max(1, len([p for p in parts if p.strip()]))
+
+                if current_pos + seg_count >= target_pos and current_pos < target_pos:
+                    # Image 需要插入到这个 Plain 内部的某个位置
+                    # 但我们不拆分文本，直接在这个 comp 后面插入 Image
+                    new_chain.append(comp)
+                    new_chain.append(Image(file=emoji_path))
+                    current_pos += seg_count
+                else:
+                    new_chain.append(comp)
+                    current_pos += seg_count
+            else:
+                new_chain.append(comp)
+                current_pos += 1
+
+            if current_pos >= target_pos and Image(file=emoji_path) not in new_chain:
+                # 安全兜底
+                pass
+
+        # 如果还没插入（target_pos >= total），追加到末尾
+        if not any(isinstance(c, Image) and getattr(c, "file", None) == emoji_path for c in new_chain):
+            new_chain.append(Image(file=emoji_path))
+
+        return new_chain
+
+    # ---------------------------------------------------- 对话历史记录
+
+    async def _notify_history(self, event: AstrMessageEvent, emotion: str, filename: str) -> None:
+        """延迟写入一条 assistant 消息到对话历史，告知 LLM 它发送了表情包。"""
+        asyncio.create_task(self._write_to_db(event, emotion, filename))
+
+    async def _write_to_db(self, event: AstrMessageEvent, emotion: str, filename: str) -> None:
         await asyncio.sleep(8)
         try:
             cm = getattr(self.context, "conversation_manager", None)
@@ -547,19 +595,12 @@ class SendEmojisPlugin(Star):
                     history = []
             history = list(history)
             history.append({
-                "role": "assistant", "content": None,
-                "tool_calls": [{"id": call_id, "type": "function", "function": {
-                    "name": "send_emoji",
-                    "arguments": json.dumps({"emotion": emotion, "file": filename}, ensure_ascii=False),
-                }}],
-            })
-            history.append({
-                "role": "tool", "tool_call_id": call_id, "name": "send_emoji",
-                "content": f"已向用户发送了一张「{emotion}」的表情包（{filename}）。",
+                "role": "assistant",
+                "content": f"[已向用户发送了一张「{emotion}」情绪的表情包（{filename}）]",
             })
             await cm.update_conversation(unified_msg_origin=uid, conversation_id=conv_id, history=history)
         except Exception as e:
-            logger.warning(f"[sendemojis] fake tool call 写入失败: {e}")
+            logger.warning(f"[sendemojis] 表情包记录写入失败: {e}")
 
     # ------------------------------------------------------------------ 指令
 
