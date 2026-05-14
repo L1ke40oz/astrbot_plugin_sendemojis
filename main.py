@@ -164,6 +164,16 @@ class SendEmojisPlugin(Star):
                 parts.append(txt)
         return "".join(parts).strip()
 
+    # Regex pattern to strip special plugin tags from conversation history.
+    # Matches [poke], [recall], [reply:123], and similar bracket-enclosed tags
+    # injected by active_function plugin that should not leak into emotion context.
+    _TAG_STRIP_RE = re.compile(r"\[(?:poke|recall|reply:\d+)\]")
+
+    @classmethod
+    def _strip_plugin_tags(cls, text: str) -> str:
+        """Remove special plugin tags ([poke], [recall], [reply:ID]) from text."""
+        return cls._TAG_STRIP_RE.sub("", text).strip()
+
     async def _build_context_text(self, event: AstrMessageEvent, ai_reply: str = "") -> str:
         lines: list[str] = []
         try:
@@ -188,6 +198,7 @@ class SendEmojisPlugin(Star):
                             content = msg.get("content", "")
                             if not isinstance(content, str):
                                 content = str(content)
+                            content = self._strip_plugin_tags(content)
                             if not content.strip():
                                 continue
                             label = "用户" if role == "user" else ("AI" if role == "assistant" else role)
@@ -199,6 +210,7 @@ class SendEmojisPlugin(Star):
         if user_msg:
             lines.append(f"用户: {user_msg}")
         if ai_reply:
+            ai_reply = self._strip_plugin_tags(ai_reply)
             lines.append(f"AI: {ai_reply}")
 
         text = "\n".join(lines).strip()
